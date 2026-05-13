@@ -4,10 +4,14 @@
 This module contains the backtesting logic
 """
 
+import json
 import logging
+import os
 from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
 
 from numpy import isnan, nan
 from pandas import DataFrame, Series
@@ -108,6 +112,72 @@ HEADERS = [
     "exit_tag",
 ]
 
+OFFLINE_BACKTEST_ENV = "FREQTRADE_OFFLINE_BACKTEST"
+OFFLINE_MARKETS_CACHE_NAME = "markets_cache_minimal.json"
+
+
+def is_offline_backtest_enabled() -> bool:
+    return os.environ.get(OFFLINE_BACKTEST_ENV, "").lower() in {"1", "true", "yes", "on"}
+
+
+def load_offline_markets_cache(config: Config) -> dict[str, Any]:
+    user_data_dir = Path(config["user_data_dir"])
+    cache_path = user_data_dir / OFFLINE_MARKETS_CACHE_NAME
+    if not cache_path.exists():
+        raise OperationalException(
+            f"Offline backtesting is enabled, but market cache was not found: {cache_path}"
+        )
+
+    with cache_path.open(encoding="utf-8") as cache_file:
+        cache_data = json.load(cache_file)
+
+    markets = cache_data.get("markets")
+    if not markets:
+        raise OperationalException(f"Offline market cache has no markets: {cache_path}")
+
+    return cache_data
+
+
+def create_offline_leverage_tiers(markets: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    leverage_tiers: dict[str, list[dict[str, Any]]] = {}
+    for pair, market in markets.items():
+        leverage_limit = market.get("limits", {}).get("leverage", {})
+        max_leverage = leverage_limit.get("max") or 1
+        leverage_tiers[pair] = [
+            {
+                "minNotional": 0,
+                "maxNotional": None,
+                "maintenanceMarginRate": 0.004,
+                "maxLeverage": max_leverage,
+                "maintAmt": 0.0,
+            }
+        ]
+    return leverage_tiers
+
+
+def apply_offline_markets_cache(exchange: Exchange, config: Config) -> None:
+    cache_data = load_offline_markets_cache(config)
+    markets = cache_data["markets"]
+    currencies = cache_data.get("currencies") or {}
+    precision_mode = cache_data.get("precision_mode")
+
+    exchange._markets = markets
+    exchange._trading_fees = cache_data.get("fees") or {}
+    exchange._leverage_tiers = cache_data.get("leverage_tiers") or create_offline_leverage_tiers(
+        markets
+    )
+
+    for ccxt_api in (exchange._api, exchange._api_async):
+        if precision_mode is not None:
+            ccxt_api.precisionMode = precision_mode
+        ccxt_api.set_markets(markets, currencies)
+
+    logger.info(
+        "Loaded offline market cache from %s with %s markets.",
+        Path(config["user_data_dir"]) / OFFLINE_MARKETS_CACHE_NAME,
+        len(markets),
+    )
+
 
 class Backtesting:
     """
@@ -142,8 +212,15 @@ class Backtesting:
 
         self._exchange_name = self.config["exchange"]["name"]
         self.__initial_backtest = exchange is None
+        offline_backtest_enabled = is_offline_backtest_enabled()
         if not exchange:
-            exchange = ExchangeResolver.load_exchange(self.config, load_leverage_tiers=True)
+            exchange = ExchangeResolver.load_exchange(
+                self.config,
+                validate=not offline_backtest_enabled,
+                load_leverage_tiers=not offline_backtest_enabled,
+            )
+            if offline_backtest_enabled:
+                apply_offline_markets_cache(exchange, self.config)
         self.exchange = exchange
 
         self.dataprovider = DataProvider(self.config, self.exchange)
